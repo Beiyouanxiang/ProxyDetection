@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .build-venv/
+.conda-linux/
 .venv/
 build/
 dist/

@@ -194,7 +194,7 @@ class Monitor:
                 self.events.put((generation, kind, True, data, time.time()))
             except (ValueError, OSError, subprocess.SubprocessError) as error:
                 self.events.put((generation, kind, False, str(error), time.time()))
-            period = config["interval"] if kind == "geo" else 1
+            period = config["interval"] if kind == "geo" else 6
             next_run = started + period
             if next_run <= time.monotonic():
                 # Never accumulate requests while a previous probe is still running.
@@ -213,37 +213,71 @@ class Widget:
         self.geo_ok = False
         self.geo_time = 0
         self.latency_ok = None
+        self.consecutive_failures = 0
+        self.alarm_active = False
         self.last_error = "等待检测"
         self.settings_window = None
+        self.label_widgets = []
+        self.base_width = 300
         root.title("ProxyWatch · 代理监测")
-        root.geometry("390x450")
-        root.minsize(390, 430)
+        root.geometry("300x350")
+        root.minsize(240, 270)
         root.configure(bg="#111827")
+        if os.name == "nt":
+            root.attributes("-toolwindow", True)
         root.attributes("-topmost", bool(self.config["topmost"]))
         self.status = self.label("正在检测…", 17, "#fbbf24")
         self.route = self.label(self.config["mode"], 10, "#94a3b8")
         self.ip_label = self.label("出口 IP：—", 16)
         self.location = self.label("归属地：—", 11)
-        self.owner = self.label("ASN / 运营商：—", 10, "#94a3b8")
         self.delay = self.label("HTTPS 响应延时：—", 15)
         self.stats = self.label("最近 60 次失败率：—", 10, "#94a3b8")
-        self.chart = tk.Canvas(root, height=55, bg="#111827", highlightthickness=0)
-        self.chart.pack(fill="x", padx=16, pady=3)
+        self.chart = tk.Canvas(root, height=45, bg="#111827", highlightthickness=0)
+        self.chart.pack(fill="both", expand=True, padx=12, pady=2)
         self.detail = self.label("", 9, "#94a3b8")
         buttons = tk.Frame(root, bg="#111827")
-        buttons.pack(fill="x", padx=14, pady=8)
+        self.button_frame = buttons
+        buttons.pack(fill="x", padx=10, pady=6)
+        self.button_style = ttk.Style(root)
+        self.button_style.configure("Responsive.TButton", font=("Segoe UI", 10))
+        self.buttons = []
         for title, command in (("设置", self.settings), ("刷新 IP", self.monitor.refresh.set),
                                ("ping0 详情", self.open_details)):
-            ttk.Button(buttons, text=title, command=command).pack(side="left", expand=True, fill="x", padx=2)
+            button = ttk.Button(buttons, text=title, command=command, style="Responsive.TButton")
+            button.pack(side="left", expand=True, fill="x", padx=2)
+            self.buttons.append(button)
+        root.bind("<Configure>", self.on_resize)
+        root.after_idle(self.apply_responsive_layout)
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.monitor.start()
         root.after(100, self.tick)
 
     def label(self, value, size, color="#e5e7eb"):
         label = self.tk.Label(self.root, text=value, font=("Segoe UI", size), bg="#111827",
-                              fg=color, anchor="w", justify="left", wraplength=360)
-        label.pack(fill="x", padx=16, pady=3)
+                              fg=color, anchor="w", justify="left", wraplength=310)
+        label.pack(fill="x", padx=12, pady=2)
+        self.label_widgets.append((label, size))
         return label
+
+    def on_resize(self, event):
+        if event.widget is self.root:
+            self.apply_responsive_layout(event.width)
+
+    def apply_responsive_layout(self, width=None):
+        width = width or self.root.winfo_width()
+        if width < 100:
+            return
+        scale = min(1.3, max(0.72, width / self.base_width))
+        padding = max(6, round(12 * scale))
+        wraplength = max(200, width - 2 * padding)
+        for label, base_size in self.label_widgets:
+            label.config(font=("Segoe UI", max(8, round(base_size * scale))), wraplength=wraplength)
+            label.pack_configure(padx=padding, pady=max(1, round(2 * scale)))
+        self.chart.pack_configure(padx=padding)
+        self.chart.config(height=max(32, round(45 * scale)))
+        self.button_frame.pack_configure(padx=max(6, round(10 * scale)), pady=max(3, round(6 * scale)))
+        self.button_style.configure("Responsive.TButton", font=("Segoe UI", max(8, round(10 * scale))))
+        self.draw_chart()
 
     def tick(self):
         try:
@@ -257,17 +291,25 @@ class Widget:
                         self.geo, self.geo_time = data, stamp
                         self.ip_label.config(text="出口 IP：" + data["ip"])
                         self.location.config(text=data["location"])
-                        self.owner.config(text=data["asn"] + " · " + data["org"])
                         self.detail.config(text="IP 更新 " + time.strftime("%H:%M:%S", time.localtime(stamp)))
                     else:
                         self.detail.config(text="IP 检测失败：" + data + ("（显示上次结果）" if self.geo else ""))
                 else:
                     self.latency_ok = ok
                     self.last_error = "" if ok else data
+                    if ok:
+                        self.consecutive_failures = 0
+                        self.alarm_active = False
+                    else:
+                        self.consecutive_failures += 1
+                        if self.consecutive_failures >= 10 and not self.alarm_active:
+                            self.alarm_active = True
+                            self.root.bell()
                     self.samples.append(data["ms"] if ok else None)
                     self.delay.config(text="HTTPS 响应延时：%.0f ms" % data["ms"] if ok else "HTTPS 响应延时：失败")
                     failures = sum(value is None for value in self.samples)
-                    self.stats.config(text="最近 %d 次失败率：%.0f%% · 每秒尝试一次" % (len(self.samples), failures / len(self.samples) * 100))
+                    alarm = " · 连续失败 %d 次，已告警" % self.consecutive_failures if self.consecutive_failures >= 10 else " · 连续失败 %d/10" % self.consecutive_failures
+                    self.stats.config(text="最近 %d 次失败率：%.0f%% · 每 6 秒检测一次%s" % (len(self.samples), failures / len(self.samples) * 100, alarm))
                     self.draw_chart()
         except queue.Empty:
             pass
@@ -290,11 +332,14 @@ class Widget:
     def draw_chart(self):
         self.chart.delete("all")
         width = max(self.chart.winfo_width(), 100)
+        chart_height = max(self.chart.winfo_height(), int(self.chart.cget("height")))
+        bottom = chart_height - 2
+        bar_max = max(4, chart_height - 5)
         maximum = max([v for v in self.samples if v is not None] + [100])
         for index, value in enumerate(self.samples):
             x = width * index / 60
-            height = 48 if value is None else max(2, value / maximum * 48)
-            self.chart.create_rectangle(x, 53 - height, x + max(2, width / 60 - 2), 53,
+            height = bar_max if value is None else max(2, value / maximum * bar_max)
+            self.chart.create_rectangle(x, bottom - height, x + max(2, width / 60 - 2), bottom,
                                         fill="#f87171" if value is None else "#38bdf8", outline="")
 
     def open_details(self):
@@ -322,7 +367,7 @@ class Widget:
         ttk.Label(window, text="IP 刷新间隔").grid(row=5, column=0, sticky="w", padx=10)
         ttk.Combobox(window, textvariable=interval, values=("1 分钟", "5 分钟"), state="readonly").grid(row=5, column=1, sticky="w", padx=10)
         ttk.Checkbutton(window, text="窗口置顶", variable=topmost).grid(row=6, column=1, sticky="w", padx=10, pady=7)
-        ttk.Label(window, text="系统模式读取 Windows 静态代理 / 环境变量；PAC、Linux 桌面代理请手动填地址。\nVPN/TUN 模式跟随系统路由；可填写预期出口 IP 辅助确认。\n延时包含连接、TLS 和服务器响应时间，不等同于 ICMP ping。\n含账号密码的代理地址只在本次运行使用，不保存。").grid(row=7, column=0, columnspan=2, padx=10, pady=8, sticky="w")
+        ttk.Label(window, text="系统模式读取 Windows 静态代理 / 环境变量；PAC、Linux 桌面代理请手动填地址。\nVPN/TUN 模式跟随系统路由；可填写预期出口 IP 辅助确认。\n每 6 秒检测一次；连续失败 10 次会响铃并显示告警。\n延时包含连接、TLS 和服务器响应时间，不等同于 ICMP ping。\n含账号密码的代理地址只在本次运行使用，不保存。").grid(row=7, column=0, columnspan=2, padx=10, pady=8, sticky="w")
 
         def apply():
             config = {key: value.get().strip() for key, value in variables.items()}
@@ -347,9 +392,10 @@ class Widget:
             self.geo = None
             self.geo_ok = False
             self.latency_ok = None
+            self.consecutive_failures = 0
+            self.alarm_active = False
             self.ip_label.config(text="出口 IP：—")
             self.location.config(text="归属地：—")
-            self.owner.config(text="ASN / 运营商：—")
             self.delay.config(text="HTTPS 响应延时：—")
             self.stats.config(text="最近 60 次失败率：—")
             self.detail.config(text="等待新的检测结果")
